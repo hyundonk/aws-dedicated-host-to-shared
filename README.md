@@ -8,6 +8,8 @@ This script uses 'Runspace threads' for parallel threads execution to execute mi
 
 Runspace threads CANNOT directly write to the main thread's console. So to write each thread's log to the console, the script uses a queue ($outputQueue) for each thread sends logs to the queue and the main thread output logs from the queue.
 
+Also to avoid reaching AWS API throttling limit, each thread has random delay (0 ~ 15 sec) before calling EC2 APIs.
+
 
 
 
