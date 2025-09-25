@@ -152,6 +152,22 @@ function Get-UserConfirmation {
     }
 }
 
+# Function to get instance name from tags
+function Get-InstanceName {
+    param([string]$InstanceId)
+    
+    try {
+        $instanceName = aws ec2 describe-instances --instance-ids $InstanceId --query 'Reservations[0].Instances[0].Tags[?Key==`Name`].Value' --output text
+        if ([string]::IsNullOrWhiteSpace($instanceName) -or $instanceName -eq "None") {
+            return "NoName"
+        }
+        return $instanceName
+    }
+    catch {
+        return "NoName"
+    }
+}
+
 # Function to detect UTF-8 BOM
 function Test-Utf8Bom {
     param([string]$FilePath)
@@ -196,24 +212,41 @@ function Main {
         # Create shared output queue for real-time logging
         $outputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
         
+        # Create shared tracking for migration results
+        $migrationResults = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+        
         # Create runspace pool
         $runspacePool = [runspacefactory]::CreateRunspacePool(1, $maxThreads)
         $runspacePool.Open()
         
         # Script block for parallel execution with real-time output
         $scriptBlock = {
-            param($InstanceId, $OutputQueue)
+            param($InstanceId, $OutputQueue, $MigrationResults)
             
             $InstanceId = $InstanceId.Trim()
             $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             
+            # Get instance name
+            $instanceName = try {
+                $name = aws ec2 describe-instances --instance-ids $InstanceId --query 'Reservations[0].Instances[0].Tags[?Key==`Name`].Value' --output text
+                if ([string]::IsNullOrWhiteSpace($name) -or $name -eq "None") { "NoName" } else { $name }
+            } catch { "NoName" }
+            
             try {
+                # Initialize tracking for this instance
+                $MigrationResults[$InstanceId] = @{
+                    InstanceName = $instanceName
+                    Status = "InProgress"
+                    FailedStep = $null
+                    ErrorMessage = $null
+                }
+                
                 # Random initial delay to spread API calls (0-15 seconds for 120 threads)
                 $randomDelay = Get-Random -Minimum 0 -Maximum 15000
                 Start-Sleep -Milliseconds $randomDelay
                 
                 # Step 1: Stop the EC2 instance
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 1/4: Initiating stop...")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 1/4: Initiating stop...")
                 aws ec2 stop-instances --instance-ids $InstanceId | Out-Null
                 
                 # Wait for instance to stop with timeout (8 minutes)
@@ -225,16 +258,16 @@ function Main {
                     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                     
                     if ($response -eq "stopped") {
-                        $OutputQueue.Enqueue("[$currentTime] [$InstanceId] STEP 1/5: STOPPED successfully")
+                        $OutputQueue.Enqueue("[$currentTime][$instanceName][$InstanceId]  STEP 1/5: STOPPED successfully")
                         break
                     }
                     elseif (((Get-Date) - $startTime).TotalSeconds -gt 480) {
-                        $OutputQueue.Enqueue("[$currentTime] [$InstanceId] STEP 1/5: Force stopping (timeout reached)...")
+                        $OutputQueue.Enqueue("[$currentTime][$instanceName][$InstanceId]  STEP 1/5: Force stopping (timeout reached)...")
                         aws ec2 stop-instances --instance-ids $InstanceId --force | Out-Null
                         $startTime = Get-Date
                     }
                     else {
-                        $OutputQueue.Enqueue("[$currentTime] [$InstanceId] STEP 1/5: Stopping... (state: $response)")
+                        $OutputQueue.Enqueue("[$currentTime][$instanceName][$InstanceId]  STEP 1/5: Stopping... (state: $response)")
                     }
                     Start-Sleep -Seconds 10
                 }
@@ -242,16 +275,19 @@ function Main {
                 # Step 2: Modify instance placement (with larger random delay)
                 Start-Sleep -Milliseconds (Get-Random -Minimum 1000 -Maximum 3000)
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 2/5: Modifying tenancy to shared...")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 2/5: Modifying tenancy to shared...")
                 $modifyResult = aws ec2 modify-instance-placement --instance-id $InstanceId --tenancy default --query 'Return' --output text
                 
                 if ($modifyResult -eq "True") {
                     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 2/5: MODIFIED to shared tenancy successfully")
+                    $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 2/5: MODIFIED to shared tenancy successfully")
                 }
                 else {
                     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 2/5: FAILED to modify tenancy")
+                    $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 2/5: FAILED to modify tenancy")
+                    $MigrationResults[$InstanceId].Status = "Failed"
+                    $MigrationResults[$InstanceId].FailedStep = "STEP 2/5: Modify tenancy"
+                    $MigrationResults[$InstanceId].ErrorMessage = "Failed to modify instance placement"
                     return
                 }
                 
@@ -262,16 +298,16 @@ function Main {
                 $accountId = aws sts get-caller-identity --query Account --output text
                 $instanceArn = "arn:aws:ec2:${region}:${accountId}:instance/${InstanceId}"
                 
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: Constructed ARN: $instanceArn")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: Constructed ARN: $instanceArn")
                 
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: Creating billing code conversion job...")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: Creating billing code conversion job...")
                 $conversionResult = aws license-manager create-license-conversion-task-for-resource `
                     --resource-arn $instanceArn `
                     --source-license-context UsageOperation=RunInstances:0800 `
                     --destination-license-context UsageOperation=RunInstances:0002 | ConvertFrom-Json
 
                 $taskId = $conversionResult.LicenseConversionTaskId
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: Created conversion task: $taskId")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: Created conversion task: $taskId")
 
                 # Wait for conversion task to complete
                 do {
@@ -279,20 +315,23 @@ function Main {
                     $taskStatus = aws license-manager get-license-conversion-task `
                         --license-conversion-task-id $taskId | ConvertFrom-Json
                     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: Conversion status: $($taskStatus.Status)")
+                    $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: Conversion status: $($taskStatus.Status)")
                 } while ($taskStatus.Status -notin @("SUCCEEDED", "FAILED"))
 
                 if ($taskStatus.Status -eq "SUCCEEDED") {
-                    $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: License conversion completed successfully")
+                    $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: License conversion completed successfully")
                 } else {
-                    $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 3/5: License conversion failed")
+                    $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 3/5: License conversion failed")
+                    $MigrationResults[$InstanceId].Status = "Failed"
+                    $MigrationResults[$InstanceId].FailedStep = "STEP 3/5: License conversion"
+                    $MigrationResults[$InstanceId].ErrorMessage = "License conversion task failed"
                     return
                 }
 
                 # Step 4: Start the instance (with larger random delay)
                 Start-Sleep -Milliseconds (Get-Random -Minimum 1000 -Maximum 3000)
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 4/5: Initiating start...")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 4/5: Initiating start...")
                 aws ec2 start-instances --instance-ids $InstanceId | Out-Null
                 
                 # Wait for instance to start running
@@ -302,22 +341,26 @@ function Main {
                     $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                     
                     if ($response -eq "running") {
-                        $OutputQueue.Enqueue("[$currentTime] [$InstanceId] STEP 4/5: RUNNING successfully")
+                        $OutputQueue.Enqueue("[$currentTime][$instanceName][$InstanceId]  STEP 4/5: RUNNING successfully")
                         break
                     }
                     else {
-                        $OutputQueue.Enqueue("[$currentTime] [$InstanceId] STEP 4/5: Starting... (state: $response)")
+                        $OutputQueue.Enqueue("[$currentTime][$instanceName][$InstanceId]  STEP 4/5: Starting... (state: $response)")
                     }
                     Start-Sleep -Seconds 10
                 }
                 
-                # Step 4: Complete
+                # Step 5: Complete
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] STEP 5/5: COMPLETED - Migration to shared tenancy successful")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  STEP 5/5: COMPLETED - Migration to shared tenancy successful")
+                $MigrationResults[$InstanceId].Status = "Success"
             }
             catch {
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                $OutputQueue.Enqueue("[$timestamp] [$InstanceId] ERROR: $($_.Exception.Message)")
+                $OutputQueue.Enqueue("[$timestamp][$instanceName][$InstanceId]  ERROR: $($_.Exception.Message)")
+                $MigrationResults[$InstanceId].Status = "Failed"
+                $MigrationResults[$InstanceId].FailedStep = "Unknown step"
+                $MigrationResults[$InstanceId].ErrorMessage = $_.Exception.Message
             }
         }
         
@@ -334,7 +377,7 @@ function Main {
             
             $powershell = [powershell]::Create()
             $powershell.RunspacePool = $runspacePool
-            $powershell.AddScript($scriptBlock).AddArgument($instanceId).AddArgument($outputQueue) | Out-Null
+            $powershell.AddScript($scriptBlock).AddArgument($instanceId).AddArgument($outputQueue).AddArgument($migrationResults) | Out-Null
             
             $runspaces += @{
                 PowerShell = $powershell
@@ -421,6 +464,30 @@ function Main {
         # Cleanup runspace pool
         $runspacePool.Close()
         $runspacePool.Dispose()
+        
+        # Generate post-migration report
+        Write-Host ""
+        Write-Host "=== MIGRATION REPORT ==="
+        
+        $totalInstances = $migrationResults.Count
+        $successfulMigrations = ($migrationResults.Values | Where-Object { $_.Status -eq "Success" }).Count
+        $failedMigrations = ($migrationResults.Values | Where-Object { $_.Status -eq "Failed" }).Count
+        
+        Write-Host "Total migrations attempted: $totalInstances"
+        Write-Host "Successful migrations: $successfulMigrations"
+        Write-Host "Failed migrations: $failedMigrations"
+        
+        if ($failedMigrations -gt 0) {
+            Write-Host ""
+            Write-Host "=== FAILED INSTANCES ==="
+            $failedInstances = $migrationResults.GetEnumerator() | Where-Object { $_.Value.Status -eq "Failed" }
+            foreach ($failed in $failedInstances) {
+                Write-Host "Instance: $($failed.Key) ($($failed.Value.InstanceName))"
+                Write-Host "  Failed at: $($failed.Value.FailedStep)"
+                Write-Host "  Error: $($failed.Value.ErrorMessage)"
+                Write-Host ""
+            }
+        }
         
         Write-Host "All instances processed."
     }
